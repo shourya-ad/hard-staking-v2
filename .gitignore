@@ -1,0 +1,7 @@
+build/*
+.trace
+.coverage*
+
+.vscode
+
+staking.txt

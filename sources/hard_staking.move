@@ -1,28 +1,26 @@
 module hard_staking_v2::hard_staking;
 
 use hard_staking_v2::shourya_token::SHOURYA_TOKEN;
-use sui::balance::{Balance, zero};
-use sui::clock::Clock;
+use sui::balance::{Self, Balance, zero};
+use sui::clock::{Self, Clock};
 use sui::coin::{Self, Coin};
 use sui::event;
-use sui::table::{Table, new};
-use sui::vec_set::{VecSet, empty};
+use sui::table::{Self, Table, new};
+use sui::vec_set::{Self, VecSet, empty};
 
 // === Error Codes ===
 const E_NOT_OWNER: u64 = 1000;
 const E_NOT_ADMIN: u64 = 1001;
-const E_INVALID_TOKEN_TYPE: u64 = 1003;
-const E_INVALID_LOCK_PERIOD: u64 = 1004;
-const E_STAKE_STILL_LOCKED: u64 = 1005;
-const E_INVALID_STAKE_ID: u64 = 1006;
-const E_STAKE_ALREADY_WITHDRAWN: u64 = 1007;
-const E_MAX_ADMINS_REACHED: u64 = 1008;
-const E_ADMIN_ALREADY_PRESENT: u64 = 1009;
-const E_ADMIN_CANNOT_ADD_ADMIN: u64 = 1010;
-const E_INSUFFICIENT_STAKE_AMOUNT: u64 = 1011;
-const E_CONTRACT_ALREADY_PAUSED: u64 = 1012;
-const E_ADMIN_NOT_FOUND: u64 = 1012;
-const E_CONTRACT_ALREADY_UNPAUSED: u64 = 1013;
+const E_INVALID_LOCK_PERIOD: u64 = 1002;
+const E_STAKE_STILL_LOCKED: u64 = 1003;
+const E_INVALID_STAKE_ID: u64 = 1004;
+const E_STAKE_ALREADY_WITHDRAWN: u64 = 1005;
+const E_MAX_ADMINS_REACHED: u64 = 1006;
+const E_ADMIN_ALREADY_PRESENT: u64 = 1007;
+const E_INSUFFICIENT_STAKE_AMOUNT: u64 = 1008;
+const E_CONTRACT_ALREADY_PAUSED: u64 = 1009;
+const E_ADMIN_NOT_FOUND: u64 = 1010;
+const E_CONTRACT_ALREADY_UNPAUSED: u64 = 1011;
 
 // === Constants ===
 const MAX_ADMINS: u64 = 2;
@@ -62,6 +60,7 @@ public struct StakingPool has key {
     user_stakes: Table<address, vector<StakePosition>>,
     total_staked: u64,
     next_stake_id: u64,
+    total_penalty_collected: u64,
 }
 
 public struct StakePosition has copy, drop, store {
@@ -147,6 +146,7 @@ fun init(ctx: &mut TxContext) {
         user_stakes: new(ctx),
         total_staked: 0,
         next_stake_id: 1,
+        total_penalty_collected: 0,
     };
 
     transfer::share_object(staking_pool);
@@ -233,4 +233,214 @@ public fun stake(
     lock_in_period_days: u64,
     clock: &Clock,
     ctx: &mut TxContext,
-) {}
+) {
+    assert!(!pool.is_paused, E_CONTRACT_ALREADY_PAUSED);
+
+    let lock_in_period = validate_and_get_lock_in_period(lock_in_period_days);
+
+    let staker = tx_context::sender(ctx);
+    let amount = coin::value(&asset);
+
+    assert!(amount > 0, E_INSUFFICIENT_STAKE_AMOUNT);
+
+    let current_time = clock::timestamp_ms(clock);
+    let maturing_time = current_time + (lock_in_period * 1000);
+
+    let user_stake_position = StakePosition {
+        stake_id: pool.next_stake_id,
+        staker,
+        amount,
+        lock_in_period,
+        start_timestamp: current_time,
+        unlock_timestamp: maturing_time,
+        status: STATUS_ACTIVE,
+        penalty_paid: 0,
+    };
+
+    if (!vec_set::contains(&pool.unique_stakers, &staker)) {
+        vec_set::insert(&mut pool.unique_stakers, staker);
+    };
+    if (!table::contains(&pool.user_stakes, staker)) {
+        table::add(&mut pool.user_stakes, staker, vector::empty());
+    };
+    let stakes = table::borrow_mut(&mut pool.user_stakes, staker);
+    vector::push_back(stakes, user_stake_position);
+
+    pool.next_stake_id = pool.next_stake_id + 1;
+    pool.total_staked = pool.total_staked + amount;
+
+    let coin_balance = coin::into_balance(asset);
+    balance::join(&mut pool.staked_balance, coin_balance);
+
+    event::emit(AssetStaked {
+        staker,
+        stake_id: user_stake_position.stake_id,
+        amount,
+        lock_in_period,
+        unlock_timestamp: maturing_time,
+    });
+}
+
+/// Normal unstake after lock period expires
+public fun unstake(
+    pool: &mut StakingPool,
+    stake_id: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Coin<SHOURYA_TOKEN> {
+    assert!(!pool.is_paused, E_CONTRACT_ALREADY_PAUSED);
+
+    let staker = tx_context::sender(ctx);
+    let current_time = clock::timestamp_ms(clock);
+
+    assert!(table::contains(&pool.user_stakes, staker), E_INVALID_STAKE_ID);
+
+    let stakes = table::borrow_mut(&mut pool.user_stakes, staker);
+
+    let (found, index) = find_stake_by_id(stakes, stake_id);
+
+    assert!(found, E_INVALID_STAKE_ID);
+
+    let stake = vector::borrow_mut(stakes, index);
+
+    assert!(stake.status == STATUS_ACTIVE, E_STAKE_ALREADY_WITHDRAWN);
+    assert!(current_time >= stake.unlock_timestamp, E_STAKE_STILL_LOCKED);
+
+    let amount = stake.amount;
+
+    stake.status = STATUS_WITHDRAWN;
+
+    pool.total_staked = pool.total_staked - amount;
+
+    let unstaking_amount = balance::split(&mut pool.staked_balance, amount);
+    let unstaking_amount_coins = coin::from_balance(unstaking_amount, ctx);
+
+    event::emit(AssetUnstaked {
+        staker,
+        stake_id,
+        amount,
+    });
+    unstaking_amount_coins
+}
+
+public fun emergency_unstake(
+    pool: &mut StakingPool,
+    stake_id: u64,
+    ctx: &mut TxContext,
+): Coin<SHOURYA_TOKEN> {
+    assert!(!pool.is_paused, E_CONTRACT_ALREADY_PAUSED);
+
+    let staker = tx_context::sender(ctx);
+
+    assert!(table::contains(&pool.user_stakes, staker), E_INVALID_STAKE_ID);
+
+    let stakes = table::borrow_mut(&mut pool.user_stakes, staker);
+
+    let (found, index) = find_stake_by_id(stakes, stake_id);
+
+    assert!(found, E_INVALID_STAKE_ID);
+
+    let stake = vector::borrow_mut(stakes, index);
+
+    assert!(stake.status == STATUS_ACTIVE, E_STAKE_ALREADY_WITHDRAWN);
+
+    let amount = stake.amount;
+    let penalty = (amount * PENALTY_PERCENTAGE) / 100;
+
+    let amount_to_return = amount - penalty;
+
+    stake.status = STATUS_EMERGENCY;
+    stake.penalty_paid = penalty;
+
+    pool.total_staked = pool.total_staked - amount;
+    pool.total_penalty_collected = pool.total_penalty_collected + penalty;
+
+    let mut total_withdrawal = balance::split(&mut pool.staked_balance, amount);
+
+    let penalty_balance = balance::split(&mut total_withdrawal, penalty);
+    balance::join(&mut pool.total_penalty, penalty_balance);
+
+    let unstaking_amount_coins = coin::from_balance(total_withdrawal, ctx);
+
+    event::emit(EmergencyAssetUnstaked {
+        staker,
+        stake_id,
+        amount_returned: amount_to_return,
+        penalty,
+    });
+
+    unstaking_amount_coins
+}
+
+// === View Fundtions ===
+
+/// Get all unique staker addresses
+public fun get_unique_stakers(pool: &StakingPool): vector<address> {
+    vec_set::into_keys(*&pool.unique_stakers)
+}
+
+/// Get all staking positions for a specific address
+public fun get_user_stakes(pool: &StakingPool, staker: address): vector<StakePosition> {
+    if (table::contains(&pool.user_stakes, staker)) {
+        *table::borrow(&pool.user_stakes, staker)
+    } else {
+        vector::empty()
+    }
+}
+
+/// Get active stakes only for a user
+public fun get_active_user_stakes(pool: &StakingPool, staker: address): vector<StakePosition> {
+    let all_active_user_stake = get_user_stakes(pool, staker);
+    let mut active_stakes = vector::empty<StakePosition>();
+
+    let mut i = 0;
+    let len = vector::length(&all_active_user_stake);
+
+    while (i < len) {
+        let stake = vector::borrow(&all_active_user_stake, i);
+        if (stake.status == STATUS_ACTIVE) {
+            vector::push_back(&mut active_stakes, *stake);
+        };
+        i = i + 1;
+    };
+    active_stakes
+}
+
+/// Get pool statistics
+public fun get_pool_stats(pool: &StakingPool): (u64, u64, u64, u64, bool) {
+    (
+        pool.total_staked,
+        pool.total_penalty_collected,
+        vec_set::length(&pool.unique_stakers),
+        balance::value(&pool.total_penalty),
+        pool.is_paused,
+    )
+}
+
+// === Helper Functions ===
+fun validate_and_get_lock_in_period(days: u64): u64 {
+    if (days == 30) {
+        LOCK_PERIOD_30_DAYS
+    } else if (days == 60) {
+        LOCK_PERIOD_60_DAYS
+    } else if (days == 90) {
+        LOCK_PERIOD_90_DAYS
+    } else {
+        abort E_INVALID_LOCK_PERIOD
+    }
+}
+
+fun find_stake_by_id(stakes: &vector<StakePosition>, stake_id: u64): (bool, u64) {
+    let mut i = 0;
+    let len = vector::length(stakes);
+
+    while (i < len) {
+        let stake = vector::borrow(stakes, i);
+        if (stake.stake_id == stake_id) {
+            return (true, i)
+        };
+        i = i + 1;
+    };
+
+    (false, 0)
+}

@@ -125,7 +125,6 @@ public struct AdminCapRemoved has copy, drop {
 }
 
 // === Init Function ===
-
 fun init(ctx: &mut TxContext) {
     let owner_cap = OwnerCap {
         id: object::new(ctx),
@@ -151,7 +150,7 @@ fun init(ctx: &mut TxContext) {
 
     transfer::share_object(staking_pool);
 
-    transfer::public_transfer(owner_cap, sender);
+    transfer::transfer(owner_cap, sender);
 }
 
 // === Owner functions ===
